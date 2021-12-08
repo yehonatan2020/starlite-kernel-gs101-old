@@ -8,6 +8,7 @@
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/export.h>
+#include <linux/module.h>
 #include <linux/namei.h>
 #include <linux/sched/xacct.h>
 #include <linux/writeback.h>
@@ -18,8 +19,30 @@
 #include <linux/backing-dev.h>
 #include "internal.h"
 
+bool fsync_enabled = true;
+module_param(fsync_enabled, bool, 0644);
+
 #define VALID_FLAGS (SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE| \
 			SYNC_FILE_RANGE_WAIT_AFTER)
+
+/*
+ * Do the filesystem syncing work. For simple filesystems
+ * writeback_inodes_sb(sb) just dirties buffers with inodes so we have to
+ * submit IO for these buffers via __sync_blockdev(). This also speeds up the
+ * wait == 1 case since in that case write_inode() functions do
+ * sync_dirty_buffer() and thus effectively write one block at a time.
+ */
+static int __sync_filesystem(struct super_block *sb, int wait)
+{
+	if (wait)
+		sync_inodes_sb(sb);
+	else
+		writeback_inodes_sb(sb, WB_REASON_SYNC);
+
+	if (sb->s_op->sync_fs)
+		sb->s_op->sync_fs(sb, wait);
+	return __sync_blockdev(sb->s_bdev, wait);
+}
 
 /*
  * Write out and wait upon all dirty data associated with this
@@ -28,7 +51,7 @@
  */
 int sync_filesystem(struct super_block *sb)
 {
-	int ret = 0;
+	int ret;
 
 	/*
 	 * We need to be protected against the filesystem going from
@@ -42,31 +65,10 @@ int sync_filesystem(struct super_block *sb)
 	if (sb_rdonly(sb))
 		return 0;
 
-	/*
-	 * Do the filesystem syncing work.  For simple filesystems
-	 * writeback_inodes_sb(sb) just dirties buffers with inodes so we have
-	 * to submit I/O for these buffers via __sync_blockdev().  This also
-	 * speeds up the wait == 1 case since in that case write_inode()
-	 * methods call sync_dirty_buffer() and thus effectively write one block
-	 * at a time.
-	 */
-	writeback_inodes_sb(sb, WB_REASON_SYNC);
-	if (sb->s_op->sync_fs) {
-		ret = sb->s_op->sync_fs(sb, 0);
-		if (ret)
-			return ret;
-	}
-	ret = __sync_blockdev(sb->s_bdev, 0);
-	if (ret)
+	ret = __sync_filesystem(sb, 0);
+	if (ret < 0)
 		return ret;
-
-	sync_inodes_sb(sb);
-	if (sb->s_op->sync_fs) {
-		ret = sb->s_op->sync_fs(sb, 1);
-		if (ret)
-			return ret;
-	}
-	return __sync_blockdev(sb->s_bdev, 1);
+	return __sync_filesystem(sb, 1);
 }
 EXPORT_SYMBOL_NS(sync_filesystem, ANDROID_GKI_VFS_EXPORT_ONLY);
 
@@ -162,9 +164,14 @@ void emergency_sync(void)
  */
 SYSCALL_DEFINE1(syncfs, int, fd)
 {
-	struct fd f = fdget(fd);
+	struct fd f;
 	struct super_block *sb;
 	int ret, ret2;
+
+	if (!fsync_enabled)
+		return 0;
+
+	f = fdget(fd);
 
 	if (!f.file)
 		return -EBADF;
@@ -195,6 +202,9 @@ int vfs_fsync_range(struct file *file, loff_t start, loff_t end, int datasync)
 {
 	struct inode *inode = file->f_mapping->host;
 
+	if (!fsync_enabled)
+		return 0;
+
 	if (!file->f_op->fsync)
 		return -EINVAL;
 	if (!datasync && (inode->i_state & I_DIRTY_TIME))
@@ -213,14 +223,20 @@ EXPORT_SYMBOL(vfs_fsync_range);
  */
 int vfs_fsync(struct file *file, int datasync)
 {
+
 	return vfs_fsync_range(file, 0, LLONG_MAX, datasync);
 }
 EXPORT_SYMBOL(vfs_fsync);
 
 static int do_fsync(unsigned int fd, int datasync)
 {
-	struct fd f = fdget(fd);
+	struct fd f;
 	int ret = -EBADF;
+
+	if (!fsync_enabled)
+		return 0;
+
+	f = fdget(fd);
 
 	if (f.file) {
 		ret = vfs_fsync(f.file, datasync);
@@ -247,6 +263,9 @@ int sync_file_range(struct file *file, loff_t offset, loff_t nbytes,
 	struct address_space *mapping;
 	loff_t endbyte;			/* inclusive */
 	umode_t i_mode;
+
+	if (!fsync_enabled)
+		return 0;
 
 	ret = -EINVAL;
 	if (flags & ~VALID_FLAGS)
