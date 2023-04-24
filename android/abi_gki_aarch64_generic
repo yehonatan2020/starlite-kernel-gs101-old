@@ -870,10 +870,12 @@
   filp_close
   filp_open_block
   find_extend_vma
+  find_first_bit
+  find_first_zero_bit
+  find_get_pid
   find_last_bit
   find_next_bit
   find_next_zero_bit
-  find_get_pid
   find_pid_ns
   find_task_by_vpid
   find_vma
